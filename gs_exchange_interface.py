@@ -167,7 +167,7 @@ class EWS(_BaseCalendar):
         )
         self._DoRequest(soapBody)
 
-    def _DoRequest(self, soapBody):
+    def _DoRequest(self, soapBody, truncatePrint=False):
         # API_VERSION = 'Exchange2013'
         # API_VERSION = 'Exchange2007_SP1'
 
@@ -235,9 +235,13 @@ class EWS(_BaseCalendar):
             data=xml,
             verify=self._verifyCerts,
         )
-        if self._debug: print('resp.status_code=', resp.status_code)
-        if self._debug: print('resp.reason=', resp.reason)
-        if self._debug: print('resp.text=', resp.text)
+        if self._debug:
+            print('resp.status_code=', resp.status_code)
+            print('resp.reason=', resp.reason)
+            if truncatePrint:
+                print('resp.text=', resp.text[:1024])
+            else:
+                print('resp.text=', resp.text)
 
         if resp.ok and RE_ERROR_CLASS.search(resp.text) is None:
             self._NewConnectionStatus('Connected')
@@ -520,7 +524,8 @@ class EWS(_BaseCalendar):
         # returns a list of attachment IDs
 
         itemId = calItem.Get('ItemId')
-        regExAttKey = re.compile(r'AttachmentId Id=\"(\S+)\"')
+        regExAttachmentID = re.compile('AttachmentId Id=\"(\S+)\"')
+        regExAttachmentName = re.compile('<t:Name>(.+)</t:Name>')
         xmlBody = """
                 <m:GetItem>
                   <m:ItemShape>
@@ -530,27 +535,40 @@ class EWS(_BaseCalendar):
                       <t:FieldURI FieldURI="item:HasAttachments" />
                     </t:AdditionalProperties>
                   </m:ItemShape>
+                  
                   <m:ItemIds>
                     <t:ItemId Id="{}" />
                   </m:ItemIds>
+                  
                 </m:GetItem>
               """.format(itemId)
 
         resp = self._DoRequest(xmlBody)
-        print('540 resp=', resp)
-        attachmentIdList = regExAttKey.findall(resp.text)
-        return [_Attachment(ID, self) for ID in attachmentIdList]
+        if self._debug: print('540 resp=', resp.status_code)
+        attachmentIdList = regExAttachmentID.findall(resp.text)
+
+        foundNames = regExAttachmentName.findall(resp.text)
+        foundIDs = regExAttachmentID.findall(resp.text)
+
+        ret = dict(zip(foundNames, foundIDs))
+
+        if self._debug:
+            print('foundNames=', foundNames)
+            print('foundIDs=', foundIDs)
+            print('GetAttachments ret=', ret)
+
+        return [_Attachment(ID, name, self) for name, ID in ret.items()]
 
 
 class _Attachment:
-    def __init__(self, AttachmentId, parentExchange):
+    def __init__(self, AttachmentId, name, parentExchange):
         print('_Attachment(', AttachmentId, parentExchange)
-        self.Filename = None
+        self.Filename = name
         self.ID = AttachmentId
         self._parentExchange = parentExchange
         self._content = None
 
-    def _Update(self):
+    def _Update(self, getContent=True):
         # sets the filename and content of attachment object
 
         regExReponse = re.compile(r'<m:ResponseCode>(.+)</m:ResponseCode>')
@@ -559,12 +577,17 @@ class _Attachment:
 
         xmlBody = """
                 <m:GetAttachment>
-                  <m:AttachmentIds>
-                    <t:AttachmentId Id="{}" />
-                  </m:AttachmentIds>
-                </m:GetAttachment>""".format(self.ID)
+                    <m:AttachmentIds>
+                        <t:AttachmentId Id="{ID}" />
+                    </m:AttachmentIds>
+                    
+                </m:GetAttachment>""".format(
+            ID=self.ID,
+            getContent=str(getContent).lower(),
+            fieldURIContent='<t:FieldURI FieldURI="item:Content" />' if getContent else ''
+        )
 
-        resp = self._parentExchange._DoRequest(xmlBody)
+        resp = self._parentExchange._DoRequest(xmlBody, truncatePrint=True)
 
         responseCode = regExReponse.search(resp.text).group(1)
         if responseCode == 'NoError':  # Handle errors sent by the server
@@ -581,14 +604,15 @@ class _Attachment:
 
         return self._content
 
-    def GetContentSize(self):
+    @property
+    def Size(self):
         # return size of content in KB
-        return len(self.GetContent()) / 1024
+        return len(self.Read()) / 1024
 
     @property
     def Name(self):
         if self.Filename is None:
-            self._Update()
+            self._Update(getContent=False)
         return self.Filename
 
     def __str__(self):
@@ -652,7 +676,7 @@ if __name__ == '__main__':
 
             if event.HasAttachments():
                 for attach in event.Attachments:
-                    open(attach.Name, 'wb').write(attach.Read())
+                    # open(attach.Name, 'wb').write(attach.Read())
                     print('attach=', attach)
 
         break
