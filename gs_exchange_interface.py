@@ -300,6 +300,7 @@ class EWS(_BaseCalendar):
                         <t:FieldURI FieldURI="calendar:RequiredAttendees" />
                         <t:FieldURI FieldURI="calendar:OptionalAttendees" />
                         <t:FieldURI FieldURI="item:HasAttachments" />
+                        <t:FieldURI FieldURI="item:Size" />
                         <t:FieldURI FieldURI="item:Sensitivity" />
                     </t:AdditionalProperties>
                 </m:ItemShape>
@@ -531,9 +532,10 @@ class EWS(_BaseCalendar):
                   <m:ItemShape>
                     <t:BaseShape>IdOnly</t:BaseShape>
                     <t:AdditionalProperties>
-                      <t:FieldURI FieldURI="item:Attachments" />
+                      <t:FieldURI FieldURI="item:Attachments"/>
                       <t:FieldURI FieldURI="item:HasAttachments" />
                     </t:AdditionalProperties>
+                    
                   </m:ItemShape>
                   
                   <m:ItemIds>
@@ -544,8 +546,8 @@ class EWS(_BaseCalendar):
               """.format(itemId)
 
         resp = self._DoRequest(xmlBody)
-        if self._debug: print('540 resp=', resp.status_code)
-        attachmentIdList = regExAttachmentID.findall(resp.text)
+        if self._debug:
+            print('540 resp=', resp.status_code)
 
         foundNames = regExAttachmentName.findall(resp.text)
         foundIDs = regExAttachmentID.findall(resp.text)
@@ -577,17 +579,21 @@ class _Attachment:
 
         xmlBody = """
                 <m:GetAttachment>
+                
+                    <t:AttachmentShape>
+                        
+                    </t:AttachmentShape>
+                    
                     <m:AttachmentIds>
                         <t:AttachmentId Id="{ID}" />
                     </m:AttachmentIds>
                     
                 </m:GetAttachment>""".format(
             ID=self.ID,
-            getContent=str(getContent).lower(),
-            fieldURIContent='<t:FieldURI FieldURI="item:Content" />' if getContent else ''
         )
 
-        resp = self._parentExchange._DoRequest(xmlBody, truncatePrint=True)
+        resp = self._parentExchange._DoRequest(xmlBody,
+                                               truncatePrint=True)  # the response can be up to 50MB and you dont want to print all that
 
         responseCode = regExReponse.search(resp.text).group(1)
         if responseCode == 'NoError':  # Handle errors sent by the server
@@ -606,8 +612,11 @@ class _Attachment:
 
     @property
     def Size(self):
-        # return size of content in KB
-        return len(self.Read()) / 1024
+        # return size of content in Bytes
+        # In theory you could request the size of the attachment from EWS API, or even the hash or changekey
+        # but according to this microsoft forum, it is not possible (or at least it does not work as intended)
+        # https://social.technet.microsoft.com/Forums/office/en-US/143ab86c-903a-49da-9603-03e65cbd8180/ews-how-to-get-attachment-mime-info-not-content
+        return len(self.Read())
 
     @property
     def Name(self):
@@ -676,6 +685,7 @@ if __name__ == '__main__':
 
             if event.HasAttachments():
                 for attach in event.Attachments:
+                    attach.Size
                     # open(attach.Name, 'wb').write(attach.Read())
                     print('attach=', attach)
 
