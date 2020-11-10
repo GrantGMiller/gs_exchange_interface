@@ -123,49 +123,6 @@ class EWS(_BaseCalendar):
     def Impersonation(self, newImpersonation):
         self._impersonation = newImpersonation
 
-    def GetEvents(self, startDT=None, endDT=None):
-        # Default is to return events from (now-1days) to (now+7days)
-        startDT = startDT or datetime.datetime.utcnow() - datetime.timedelta(days=1)
-        endDT = endDT or datetime.datetime.utcnow() + datetime.timedelta(days=7)
-
-        startTimestring = ConvertDatetimeToTimeString(startDT)
-        endTimestring = ConvertDatetimeToTimeString(endDT)
-
-        parentFolder = '''
-            <t:DistinguishedFolderId Id="calendar"/>
-        '''
-
-        soapBody = '''
-            <m:FindItem Traversal="Shallow">
-            <m:ItemShape>
-                <t:BaseShape>IdOnly</t:BaseShape>
-                <t:AdditionalProperties>
-                    <t:FieldURI FieldURI="item:Subject" />
-                    <t:FieldURI FieldURI="calendar:Start" />
-                    <t:FieldURI FieldURI="calendar:End" />
-                    <t:FieldURI FieldURI="item:Body" />
-                    <t:FieldURI FieldURI="calendar:Organizer" />
-                    <t:FieldURI FieldURI="calendar:RequiredAttendees" />
-                    <t:FieldURI FieldURI="calendar:OptionalAttendees" />
-                    <t:FieldURI FieldURI="item:HasAttachments" />
-                    <t:FieldURI FieldURI="item:Sensitivity" />
-                </t:AdditionalProperties>
-            </m:ItemShape>
-            <m:CalendarView 
-                MaxEntriesReturned="100" 
-                StartDate="{startTimestring}" 
-                EndDate="{endTimestring}" 
-                />
-            <m:ParentFolderIds>
-                {parentFolder}
-            </m:ParentFolderIds>
-        </m:FindItem>
-        '''.format(
-            startTimestring=startTimestring,
-            endTimestring=endTimestring,
-            parentFolder=parentFolder,
-        )
-        self._DoRequest(soapBody)
 
     def _DoRequest(self, soapBody, truncatePrint=False):
         # API_VERSION = 'Exchange2013'
@@ -360,7 +317,8 @@ class EWS(_BaseCalendar):
                 data['Body'] = bodyMatch.group(1)
 
             res = RE_HAS_ATTACHMENTS.search(matchCalItem.group(0)).group(1)
-            print('356 res=', res)
+            if self._debug:
+                print('364 res=', res)
             if 'true' in res:
                 data['HasAttachments'] = True
             elif 'false' in res:
