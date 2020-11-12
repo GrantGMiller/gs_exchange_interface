@@ -99,6 +99,10 @@ class EWS(_BaseCalendar):
         self._useImpersonationIfAvailable = True
         self._useDistinguishedFolderMailbox = False
 
+    def print(self, *a, **k):
+        if self._debug:
+            print(*a, **k)
+
     def __str__(self):
         if self._oauthCallback:
             return '<EWS: state={}, impersonation={}, auth={}, oauthCallback={}>'.format(
@@ -122,7 +126,6 @@ class EWS(_BaseCalendar):
     @Impersonation.setter
     def Impersonation(self, newImpersonation):
         self._impersonation = newImpersonation
-
 
     def _DoRequest(self, soapBody, truncatePrint=False):
         # API_VERSION = 'Exchange2013'
@@ -220,6 +223,7 @@ class EWS(_BaseCalendar):
         return resp
 
     def UpdateCalendar(self, calendar=None, startDT=None, endDT=None):
+        self.print('UpdateCalendar(', calendar, startDT, endDT)
         # Default is to return events from (now-1days) to (now+7days)
         startDT = startDT or datetime.datetime.utcnow() - datetime.timedelta(days=1)
         endDT = endDT or datetime.datetime.utcnow() + datetime.timedelta(days=7)
@@ -338,7 +342,7 @@ class EWS(_BaseCalendar):
         return ret
 
     def CreateCalendarEvent(self, subject, body, startDT, endDT):
-
+        self.print('CreateCalendarEvent(', subject, body, startDT, endDT)
         startTimeString = ConvertDatetimeToTimeString(startDT)
         endTimeString = ConvertDatetimeToTimeString(endDT)
 
@@ -388,7 +392,7 @@ class EWS(_BaseCalendar):
             self.CreateCalendarEvent(subject, body, startDT, endDT)
 
     def ChangeEventTime(self, calItem, newStartDT=None, newEndDT=None):
-
+        self.print('ChangeEventTime(', calItem, ', newStartDT=', newStartDT, ', newEndDT=', newEndDT)
         props = {}
 
         if newStartDT is not None:
@@ -464,6 +468,7 @@ class EWS(_BaseCalendar):
         resp = self._DoRequest(soapBody)
 
     def DeleteEvent(self, calItem):
+        self.print('DeleteEvent(', calItem)
         soapBody = """
                 <m:DeleteItem DeleteType="HardDelete" SendMeetingCancellations="SendToNone">
                   <m:ItemIds>
