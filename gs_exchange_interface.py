@@ -63,8 +63,9 @@ class EWS(_BaseCalendar):
             apiVersion='Exchange2007_SP1',  # TLS uses "Exchange2007_SP1"
             verifyCerts=True,
             debug=False,
+            persistentStorage='test.json',
     ):
-        super().__init__()
+        super().__init__(persistentStorage=persistentStorage, debug=debug)
         self._username = username
         self._password = password
         self._impersonation = impersonation
@@ -187,7 +188,10 @@ class EWS(_BaseCalendar):
             self._session.headers['authorization'] = 'Bearer {token}'.format(token=self._oauthCallback())
 
         if self._debug:
-            print('209 session.headers=', self._session.headers)
+            for k, v in self._session.headers.items():
+                if 'auth' in k.lower():
+                    v = v[:15]
+                self.print('header', k, v)
 
         resp = self._session.request(
             method='POST',
@@ -224,9 +228,11 @@ class EWS(_BaseCalendar):
 
     def UpdateCalendar(self, calendar=None, startDT=None, endDT=None):
         self.print('UpdateCalendar(', calendar, startDT, endDT)
-        # Default is to return events from (now-1days) to (now+7days)
-        startDT = startDT or datetime.datetime.utcnow() - datetime.timedelta(days=1)
-        endDT = endDT or datetime.datetime.utcnow() + datetime.timedelta(days=7)
+
+        startDT = startDT or datetime.datetime.now() - datetime.timedelta(days=1)
+        startDT = startDT.replace(second=0, microsecond=0)
+
+        endDT = endDT or datetime.datetime.now() + datetime.timedelta(days=7)
 
         startTimestring = ConvertDatetimeToTimeString(startDT)
         endTimestring = ConvertDatetimeToTimeString(endDT)
@@ -298,7 +304,7 @@ class EWS(_BaseCalendar):
         '''
         ret = []
         for matchCalItem in RE_CAL_ITEM.finditer(responseString):
-            if self._debug: print('matchCalItem=', matchCalItem)
+            self.print('matchCalItem=', matchCalItem.group(0))
             # go thru the resposne and find any CalendarItems.
             # parse their data and findMode CalendarItem objects
             # store CalendarItem objects in self
@@ -321,8 +327,8 @@ class EWS(_BaseCalendar):
                 data['Body'] = bodyMatch.group(1)
 
             res = RE_HAS_ATTACHMENTS.search(matchCalItem.group(0)).group(1)
-            if self._debug:
-                print('364 res=', res)
+            self.print('364 RE_HAS_ATTACHMENTS res=', res)
+
             if 'true' in res:
                 data['HasAttachments'] = True
             elif 'false' in res:
@@ -343,6 +349,9 @@ class EWS(_BaseCalendar):
 
     def CreateCalendarEvent(self, subject, body, startDT, endDT):
         self.print('CreateCalendarEvent(', subject, body, startDT, endDT)
+
+        startDT = startDT.replace(second=0, microsecond=0)
+
         startTimeString = ConvertDatetimeToTimeString(startDT)
         endTimeString = ConvertDatetimeToTimeString(endDT)
 
@@ -393,6 +402,13 @@ class EWS(_BaseCalendar):
 
     def ChangeEventTime(self, calItem, newStartDT=None, newEndDT=None):
         self.print('ChangeEventTime(', calItem, ', newStartDT=', newStartDT, ', newEndDT=', newEndDT)
+
+        if newStartDT:
+            newStartDT = newStartDT.replace(second=0, microsecond=0)
+
+        if newEndDT:
+            newEndDT = newEndDT.replace(second=0, microsecond=0)
+
         props = {}
 
         if newStartDT is not None:
@@ -633,15 +649,15 @@ if __name__ == '__main__':
     # ews.CreateCalendarEvent(
     #     subject='Test Subject ' + time.asctime(),
     #     body='Test Body ' + time.asctime(),
-    #     startDT=datetime.datetime.utcnow(),
-    #     endDT=datetime.datetime.utcnow() + datetime.timedelta(minutes=15),
+    #     startDT=datetime.datetime.now(),
+    #     endDT=datetime.datetime.now() + datetime.timedelta(minutes=15),
     # )
 
     while True:
         ews.UpdateCalendar()
-        events = ews.GetNowCalItems()
-        print('events=', events)
-        for event in events:
+        nowEvents = ews.GetNowCalItems()
+        print('nowEvents=', nowEvents)
+        for event in nowEvents:
             if 'Test Subject' in event.Get('Subject'):
                 # ews.ChangeEventTime(event, newEndDT=datetime.datetime.now())
                 pass
