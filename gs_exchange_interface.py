@@ -8,6 +8,8 @@ from base64 import b64decode
 
 import time
 
+from gs_service_accounts_base import _ServiceAccountBase
+
 try:
     from extronlib.system import ProgramLog
     import gs_requests as requests
@@ -21,6 +23,7 @@ from gs_calendar_base import (
     ConvertDatetimeToTimeString,
     ConvertTimeStringToDatetime
 )
+import gs_oauth_tools
 
 TZ_NAME = time.tzname[0]
 if TZ_NAME == 'EST':
@@ -63,7 +66,7 @@ class EWS(_BaseCalendar):
             apiVersion='Exchange2007_SP1',  # TLS uses "Exchange2007_SP1"
             verifyCerts=True,
             debug=False,
-            persistentStorage='test.json',
+            persistentStorage=None,
     ):
         super().__init__(persistentStorage=persistentStorage, debug=debug)
         self._username = username
@@ -185,12 +188,12 @@ class EWS(_BaseCalendar):
             url = 'https://outlook.office365.com/EWS/exchange.asmx'
 
         if self._authType == 'Oauth':
-            self._session.headers['authorization'] = 'Bearer {token}'.format(token=self._oauthCallback())
+            self._session.headers['Authorization'] = 'Bearer {token}'.format(token=self._oauthCallback())
 
         if self._debug:
             for k, v in self._session.headers.items():
                 if 'auth' in k.lower():
-                    v = v[:15]
+                    v = v[:15] + '...'
                 self.print('header', k, v)
 
         resp = self._session.request(
@@ -214,7 +217,7 @@ class EWS(_BaseCalendar):
                 if self._debug: print('Error Message:', match.group(1))
             self._NewConnectionStatus('Disconnected')
 
-            if 'The account does not have permission to impersonate the requested user.' in resp.text:
+            if 'The account does not have permission to impersonate the requested user.' in resp.text or not resp.ok:
                 if self._useImpersonationIfAvailable is True:
                     if self._debug: print('Switching impersonation mode')
 
@@ -607,9 +610,116 @@ class _Attachment:
         return '<Attachment: Name={}>'.format(self.Name)
 
 
+class ServiceAccount(_ServiceAccountBase):
+    def __init__(
+            self,
+            clientID=None,
+            tenantID=None,
+            oauthID=None,
+            email=None,
+            password=None
+    ):
+        self.clientID = clientID
+        self.tenantID = tenantID
+        self.oauthID = oauthID
+        self.email = email
+        self.password = password
+
+        assert (self.clientID and self.tenantID and self.oauthID) or (self.email and self.password)
+
+    def __str__(self):
+        return '<EWS ServiceAccount: clientID={}, tenantID={}, oauthID={}, email={}, password={}>'.format(
+            self.clientID[:10] + '...',
+            self.tenantID[:10] + '...',
+            self.oauthID[:10] + '...',
+            self.email,
+            len(self.password) * '*' if self.password else '***',
+        )
+
+    def GetStatus(self):
+        try:
+            if self.oauthID:
+                authManager = gs_oauth_tools.AuthManager(
+                    microsoftClientID=self.clientID,
+                    microsoftTenantID=self.tenantID,
+                )
+                user = authManager.GetUserByID(self.oauthID)
+                if user:
+                    token = user.GetAccessToken()
+                    if token:
+                        return 'Authorized'
+                    else:
+                        return 'Error 633: Token could not be retrieved'
+                else:
+                    return 'Error 635: User could not be found. OauthID={}'.format(self.oauthID)
+
+            elif self.email:
+                ews = EWS(
+                    username=self.email,
+                    password=self.password,
+                )
+                ews.UpdateCalendar()
+                if 'Connected' in ews.ConnectionStatus:
+                    return 'Authorized'
+                else:
+                    return ews.ConnectionStatus
+        except Exception as e:
+            return 'Error 650: {}'.format(e)
+
+    def GetType(self):
+        return 'Microsoft'
+
+    def GetRoomInterface(self, roomEmail, **kwargs):
+        print('EWS SA.GetRoomInterface(', roomEmail, kwargs)
+        if self.oauthID:
+            authManager = gs_oauth_tools.AuthManager(
+                microsoftClientID=self.clientID,
+                microsoftTenantID=self.tenantID,
+            )
+            user = authManager.GetUserByID(self.oauthID)
+            ews = EWS(
+                oauthCallback=user.GetAccessToken,
+                impersonation=roomEmail,
+                **kwargs
+            )
+            return ews
+
+        elif self.email:
+            ews = EWS(
+                username=self.email,
+                password=self.password,
+                impersonation=roomEmail
+            )
+            return ews
+
+
 if __name__ == '__main__':
     import creds
+    import gs_oauth_tools
+    import webbrowser
 
+    useOauth = True
+    authManager = gs_oauth_tools.AuthManager(
+        microsoftClientID=creds.clientID,
+        microsoftTenantID=creds.tenantID,
+        debug=True
+    )
+
+    MY_ID = '3888'
+
+    user = authManager.GetUserByID(MY_ID)
+    if user is None:
+        d = authManager.CreateNewUser(MY_ID, authType='Microsoft')
+        try:
+            webbrowser.open(d['verification_uri'])
+        except:
+            pass
+        print('Go to {}'.format(d['verification_uri']))
+        print('Enter code "{}"'.format(d['user_code']))
+        while authManager.GetUserByID(MY_ID) is None:
+            time.sleep(1)
+        user = authManager.GetUserByID(MY_ID)
+    print('636 user=', user)
     ews = EWS(
 
         # gm has ApplicationImpersonation
@@ -628,9 +738,10 @@ if __name__ == '__main__':
         # impersonation='Test-pm4@extron.com',
         # password='Extron1025',
 
-        username=creds.username,
-        password=creds.password,
+        username=None if useOauth else creds.username,
+        password=None if useOauth else creds.password,
         impersonation='rnchallwaysignage1@extron.com',
+        oauthCallback=None if useOauth is False else user.GetAccessToken,
         debug=True,
 
         # Covestro mock up
@@ -654,6 +765,7 @@ if __name__ == '__main__':
     # )
 
     while True:
+        print('while True')
         ews.UpdateCalendar()
         nowEvents = ews.GetNowCalItems()
         print('nowEvents=', nowEvents)
@@ -668,5 +780,4 @@ if __name__ == '__main__':
                     # open(attach.Name, 'wb').write(attach.Read())
                     print('attach=', attach)
 
-        break
         time.sleep(10)
