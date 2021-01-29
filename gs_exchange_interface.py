@@ -8,7 +8,7 @@ from base64 import b64decode
 
 import time
 
-from gs_service_accounts_base import _ServiceAccountBase
+from gs_service_accounts import _ServiceAccountBase
 
 try:
     from extronlib.system import ProgramLog
@@ -617,13 +617,18 @@ class ServiceAccount(_ServiceAccountBase):
             tenantID=None,
             oauthID=None,
             email=None,
-            password=None
+            password=None,
+            authManager=None
     ):
         self.clientID = clientID
         self.tenantID = tenantID
         self.oauthID = oauthID
         self.email = email
         self.password = password
+        self.authManager = gs_oauth_tools.AuthManager(
+            microsoftTenantID=self.tenantID,
+            microsoftClientID=self.clientID,
+        )
 
         assert (self.clientID and self.tenantID and self.oauthID) or (self.email and self.password)
 
@@ -639,11 +644,7 @@ class ServiceAccount(_ServiceAccountBase):
     def GetStatus(self):
         try:
             if self.oauthID:
-                authManager = gs_oauth_tools.AuthManager(
-                    microsoftClientID=self.clientID,
-                    microsoftTenantID=self.tenantID,
-                )
-                user = authManager.GetUserByID(self.oauthID)
+                user = self.authManager.GetUserByID(self.oauthID)
                 if user:
                     token = user.GetAccessToken()
                     if token:
@@ -670,13 +671,20 @@ class ServiceAccount(_ServiceAccountBase):
         return 'Microsoft'
 
     def GetRoomInterface(self, roomEmail, **kwargs):
-        print('EWS SA.GetRoomInterface(', roomEmail, kwargs)
+        # print('EWS SA.GetRoomInterface(', roomEmail, kwargs)
         if self.oauthID:
-            authManager = gs_oauth_tools.AuthManager(
-                microsoftClientID=self.clientID,
-                microsoftTenantID=self.tenantID,
-            )
-            user = authManager.GetUserByID(self.oauthID)
+
+            user = self.authManager.GetUserByID(self.oauthID)
+            if user is None:
+                # ProgramLog(
+                #     'EWS ServiceAccount roomEmail="{}" kwargs="{}". '
+                #     'No User with ID="{}"'.format(
+                #         roomEmail,
+                #         kwargs,
+                #         self.oauthID
+                #     ))
+                return
+
             ews = EWS(
                 oauthCallback=user.GetAccessToken,
                 impersonation=roomEmail,
