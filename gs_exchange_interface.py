@@ -3,6 +3,7 @@ All datetimes that are passed to/from this module are in the system local time.
 
 '''
 import datetime
+import json
 import re
 from base64 import b64decode
 
@@ -625,18 +626,46 @@ class ServiceAccount(_ServiceAccountBase):
         self.oauthID = oauthID
         self.email = email
         self.password = password
-        self.authManager = gs_oauth_tools.AuthManager(
-            microsoftTenantID=self.tenantID,
-            microsoftClientID=self.clientID,
-        )
+        self.authManager = authManager
 
-        assert (self.clientID and self.tenantID and self.oauthID) or (self.email and self.password)
+        assert (self.clientID and self.tenantID and self.oauthID and self.authManager) or (self.email and self.password), str(self)
+
+    @classmethod
+    def Dumper(cls, sa):
+        return json.dumps({
+            'clientID': sa.clientID,
+            'tenantID': sa.tenantID,
+            'oauthID': sa.oauthID,
+            'email': sa.email,
+            'password': sa.password,
+            'authManager': 'devices.authManager',  # todo, generalize this
+        })
+
+    @classmethod
+    def Loader(cls, strng):
+        d = json.loads(strng)
+
+        authManager = d.pop('authManager', None)
+        if authManager == 'devices.authManager':
+            import devices
+            authManager = devices.authManager
+
+        print('653 authManager=', authManager)
+        print('654 d=', d)
+
+        ret = cls(
+            authManager=authManager,
+            **d,
+        )
+        print('EWS.ServiceAccount.Loader return', ret)
+        return ret
 
     def __str__(self):
-        return '<EWS ServiceAccount: clientID={}, tenantID={}, oauthID={}, email={}, password={}>'.format(
+        return '<EWS ServiceAccount: clientID={}, tenantID={}, oauthID={}, authManager={}, email={}, password={}>'.format(
             self.clientID[:10] + '...',
             self.tenantID[:10] + '...',
             self.oauthID[:10] + '...',
+            self.authManager,
             self.email,
             len(self.password) * '*' if self.password else '***',
         )
