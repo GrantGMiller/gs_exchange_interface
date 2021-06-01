@@ -48,10 +48,14 @@ RE_START_TIME = re.compile('<t:Start>(.*?)</t:Start>')  # group(1) = start time 
 RE_END_TIME = re.compile('<t:End>(.*?)</t:End>')  # group(1) = end time string #within a CalendarItem
 RE_HTML_BODY = re.compile('<t:Body BodyType="HTML">([\w\W]*)</t:Body>', re.IGNORECASE)
 
-RE_EMAIL_ADDRESS = re.compile('.*?\@.*?\..*?')
+RE_EMAIL_ADDRESS = re.compile(
+    "[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
+)
 
 RE_ERROR_CLASS = re.compile('ResponseClass="Error"', re.IGNORECASE)
 RE_ERROR_MESSAGE = re.compile('<m:MessageText>([\w\W]*)</m:MessageText>')
+
+RE_ATTENDEE = re.compile('<t:Attendee>([\w\W]*)</t:Attendee>')
 
 
 class EWS(_BaseCalendar):
@@ -69,7 +73,6 @@ class EWS(_BaseCalendar):
             debug=False,
             persistentStorage=None,
     ):
-        super().__init__(persistentStorage=persistentStorage, debug=debug)
         self._username = username
         self._password = password
         self._impersonation = impersonation
@@ -103,6 +106,8 @@ class EWS(_BaseCalendar):
             raise TypeError('Unknown Authorization Type')
         self._useImpersonationIfAvailable = True
         self._useDistinguishedFolderMailbox = False
+
+        super().__init__(persistentStorage=persistentStorage, debug=debug)
 
     def print(self, *a, **k):
         if self._debug:
@@ -180,8 +185,7 @@ class EWS(_BaseCalendar):
             soapBody=soapBody,
         )
 
-        if self._debug:
-            print('xml=', xml)
+        self.print('xml=', xml)
 
         if self._serverURL:
             url = self._serverURL + '/EWS/exchange.asmx'
@@ -257,8 +261,9 @@ class EWS(_BaseCalendar):
             parentFolder = '''
                 <t:DistinguishedFolderId Id="calendar"/>
             '''
-
-        soapBody = '''
+        # https://docs.microsoft.com/en-us/exchange/client-developer/web-service-reference/fielduri
+        # note: attendees must be found using <GetItem>
+        soapBody = ''' 
             <m:FindItem Traversal="Shallow">
                 <m:ItemShape>
                     <t:BaseShape>IdOnly</t:BaseShape>
@@ -268,8 +273,6 @@ class EWS(_BaseCalendar):
                         <t:FieldURI FieldURI="calendar:End" />
                         <t:FieldURI FieldURI="item:Body" />
                         <t:FieldURI FieldURI="calendar:Organizer" />
-                        <t:FieldURI FieldURI="calendar:RequiredAttendees" />
-                        <t:FieldURI FieldURI="calendar:OptionalAttendees" />
                         <t:FieldURI FieldURI="item:HasAttachments" />
                         <t:FieldURI FieldURI="item:Size" />
                         <t:FieldURI FieldURI="item:Sensitivity" />
@@ -351,15 +354,20 @@ class EWS(_BaseCalendar):
 
         return ret
 
-    def CreateCalendarEvent(self, subject, body, startDT, endDT):
-        self.print('CreateCalendarEvent(', subject, body, startDT, endDT)
+    def CreateCalendarEvent(self, subject, startDT, endDT, body=None, attendees=None):
+        self.print('CreateCalendarEvent(subject=', subject, 'body=', body, 'startDT=', startDT, 'endDT=', endDT,
+                   'attendees=', attendees)
+
+        assert isinstance(startDT, datetime.datetime)
+        assert isinstance(endDT, datetime.datetime)
 
         startDT = startDT.replace(second=0, microsecond=0)
 
         startTimeString = ConvertDatetimeToTimeString(startDT)
         endTimeString = ConvertDatetimeToTimeString(endDT)
 
-        calendar = self._impersonation or self._username
+        body = body or ''
+        attendees = attendees or []
 
         if self._useDistinguishedFolderMailbox:
             parentFolder = '''
@@ -388,6 +396,7 @@ class EWS(_BaseCalendar):
                         <t:Start>{startTimeString}</t:Start>
                         <t:End>{endTimeString}</t:End>
                         <t:MeetingTimeZone TimeZoneName="{tzName}" />
+                        {attendeesXML}
                     </t:CalendarItem>
                 </m:Items>
             </m:CreateItem>
@@ -397,12 +406,13 @@ class EWS(_BaseCalendar):
             endTimeString=endTimeString,
             subject=subject,
             body=body,
-            tzName=self._myTimezoneName
+            tzName=self._myTimezoneName,
+            attendeesXML=GetAttendeesXML(attendees),
         )
         resp = self._DoRequest(soapBody)
         if 'ErrorImpersonateUserDenied' in resp.text:
             # try again
-            self.CreateCalendarEvent(subject, body, startDT, endDT)
+            self.CreateCalendarEvent(subject=subject, body=body, startDT=startDT, endDT=endDT, attendees=attendees)
 
     def ChangeEventTime(self, calItem, newStartDT=None, newEndDT=None):
         self.print('ChangeEventTime(', calItem, ', newStartDT=', newStartDT, ', newEndDT=', newEndDT)
@@ -505,6 +515,7 @@ class EWS(_BaseCalendar):
         resp = self._DoRequest(soapBody)
 
     def GetAttachments(self, calItem):
+        self.print('GetAttachments(', calItem)
         # returns a list of attachment IDs
 
         itemId = calItem.Get('ItemId')
@@ -517,6 +528,8 @@ class EWS(_BaseCalendar):
                     <t:AdditionalProperties>
                       <t:FieldURI FieldURI="item:Attachments"/>
                       <t:FieldURI FieldURI="item:HasAttachments" />
+                        <t:FieldURI FieldURI="calendar:RequiredAttendees" />
+                        <t:FieldURI FieldURI="calendar:OptionalAttendees" />
                     </t:AdditionalProperties>
                     
                   </m:ItemShape>
@@ -543,6 +556,79 @@ class EWS(_BaseCalendar):
             print('GetAttachments ret=', ret)
 
         return [_Attachment(ID, name, self) for name, ID in ret.items()]
+
+    def GetAttendees(self, calItem):
+        self.print('GetAttendees(', calItem)
+        # returns a list of attachment IDs
+
+        itemId = calItem.Get('ItemId')
+        regExAttachmentID = re.compile('AttachmentId Id=\"(\S+)\"')
+        regExAttachmentName = re.compile('<t:Name>(.+)</t:Name>')
+        xmlBody = """
+                    <m:GetItem>
+                      <m:ItemShape>
+                        <t:BaseShape>IdOnly</t:BaseShape>
+                        <t:AdditionalProperties>
+                            <t:FieldURI FieldURI="calendar:RequiredAttendees" />
+                            <t:FieldURI FieldURI="calendar:OptionalAttendees" />
+                        </t:AdditionalProperties>
+
+                      </m:ItemShape>
+
+                      <m:ItemIds>
+                        <t:ItemId Id="{}" />
+                      </m:ItemIds>
+
+                    </m:GetItem>
+                  """.format(itemId)
+
+        resp = self._DoRequest(xmlBody)
+        if self._debug:
+            print('540 resp.text=', resp.text)
+
+        ret = set()  # Use set() to prevent duplicates
+        for matchEmail in RE_EMAIL_ADDRESS.finditer(resp.text):
+            ret.add(matchEmail.group(0))
+        self.print('GetAttendees return', ret)
+        return list(ret)
+
+    def ChangeAttendees(self, calendarItem, addList=None, removeList=None):
+        self.print('ChangeAttendees(', calendarItem, 'addList=', addList, ', removeList=', removeList)
+        addList = addList or []
+        removeList = removeList or []
+
+        attendees = set(self.GetAttendees(calendarItem))
+        for email in addList:
+            attendees.add(email)
+        for email in removeList:
+            attendees.remove(email)
+
+        soapBody = """
+            <m:UpdateItem MessageDisposition="SaveOnly" ConflictResolution="AlwaysOverwrite" SendMeetingInvitationsOrCancellations="SendToNone">
+              <m:ItemChanges>
+                <t:ItemChange>
+                  <t:ItemId 
+                    Id="{itemID}"
+                    ChangeKey="{changeKey}" 
+                    />
+                  <t:Updates>
+                    <t:SetItemField>
+                        <t:FieldURI FieldURI="calendar:RequiredAttendees" />
+                         <t:CalendarItem>
+                            {attendeesXML}
+                         </t:CalendarItem>
+                    </t:SetItemField>
+                  </t:Updates>
+                </t:ItemChange>
+              </m:ItemChanges>
+            </m:UpdateItem>
+            """.format(
+            itemID=calendarItem.Get('ItemId'),
+            changeKey=calendarItem.Get('ChangeKey'),
+            attendeesXML=GetAttendeesXML(attendees)
+        )
+        resp = self._DoRequest(soapBody)
+        self.print('633 resp.text=', resp.text)
 
 
 class _Attachment:
@@ -628,7 +714,8 @@ class ServiceAccount(_ServiceAccountBase):
         self.password = password
         self.authManager = authManager
 
-        assert (self.clientID and self.tenantID and self.oauthID and self.authManager) or (self.email and self.password), str(self)
+        assert (self.clientID and self.tenantID and self.oauthID and self.authManager) or (
+                self.email and self.password), str(self)
 
     @classmethod
     def Dumper(cls, sa):
@@ -650,14 +737,10 @@ class ServiceAccount(_ServiceAccountBase):
             import devices
             authManager = devices.authManager
 
-        print('653 authManager=', authManager)
-        print('654 d=', d)
-
         ret = cls(
             authManager=authManager,
             **d,
         )
-        print('EWS.ServiceAccount.Loader return', ret)
         return ret
 
     def __str__(self):
@@ -730,6 +813,23 @@ class ServiceAccount(_ServiceAccountBase):
             return ews
 
 
+def GetAttendeesXML(attendeesList):
+    if attendeesList:
+        attendeesXML = '<t:RequiredAttendees>'
+        for a in attendeesList:
+            attendeesXML += '''
+                                    <t:Attendee>
+                                      <t:Mailbox>
+                                        <t:EmailAddress>{a}</t:EmailAddress>
+                                      </t:Mailbox>
+                                    </t:Attendee>
+                                '''.format(a=a)
+        attendeesXML += '</t:RequiredAttendees>'
+        return attendeesXML
+    else:
+        return ''
+
+
 if __name__ == '__main__':
     import creds
     import gs_oauth_tools
@@ -793,6 +893,11 @@ if __name__ == '__main__':
     ews.NewCalendarItem = lambda _, item: print('NewCalendarItem(', item)
     ews.CalendarItemChanged = lambda _, item: print('CalendarItemChanged(', item)
     ews.CalendarItemDeleted = lambda _, item: print('CalendarItemDeleted(', item)
+    ews.UpdateCalendar(
+        startDT=datetime.datetime.now().replace(hour=0, minute=0),
+        endDT=datetime.datetime.now().replace(hour=23, minute=59)
+    )
+
 
     # ews.CreateCalendarEvent(
     #     subject='Test Subject ' + time.asctime(),
@@ -801,20 +906,41 @@ if __name__ == '__main__':
     #     endDT=datetime.datetime.now() + datetime.timedelta(minutes=15),
     # )
 
-    while True:
-        print('while True')
-        ews.UpdateCalendar()
-        nowEvents = ews.GetNowCalItems()
-        print('nowEvents=', nowEvents)
-        for event in nowEvents:
-            if 'Test Subject' in event.Get('Subject'):
-                # ews.ChangeEventTime(event, newEndDT=datetime.datetime.now())
-                pass
+    def TestAttachments():
+        while True:
+            print('while True')
+            ews.UpdateCalendar()
+            nowEvents = ews.GetNowCalItems()
+            print('nowEvents=', nowEvents)
+            for event in nowEvents:
+                if 'Test Subject' in event.Get('Subject'):
+                    # ews.ChangeEventTime(event, newEndDT=datetime.datetime.now())
+                    pass
 
-            if event.HasAttachments():
-                for attach in event.Attachments:
-                    attach.Size
-                    # open(attach.Name, 'wb').write(attach.Read())
-                    print('attach=', attach)
+                if event.HasAttachments():
+                    for attach in event.Attachments:
+                        attach.Size
+                        # open(attach.Name, 'wb').write(attach.Read())
+                        print('attach=', attach)
 
-        time.sleep(10)
+            time.sleep(10)
+
+
+    # TestAttachments()
+
+    def TestAttendees():
+        # ews.CreateCalendarEvent(
+        #     subject='Test Subject ' + time.asctime(),
+        #     body='Test Body ' + time.asctime(),
+        #     startDT=datetime.datetime.now(),
+        #     endDT=datetime.datetime.now() + datetime.timedelta(minutes=15),
+        #     attendees=['grantm@extrondev.com'],
+        # )
+        for event in ews.GetNowCalItems():
+            if 'gmiller@extron.com' in ews.GetAttendees(event):
+                ews.ChangeAttendees(event, removeList=['gmiller@extron.com'])
+            else:
+                ews.ChangeAttendees(event, addList=['gmiller@extron.com'])
+
+
+    TestAttendees()
