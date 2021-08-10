@@ -6,9 +6,7 @@ import datetime
 import json
 import re
 from base64 import b64decode
-
 import time
-
 from gs_service_accounts import _ServiceAccountBase
 
 try:
@@ -20,7 +18,7 @@ except Exception as e:
 
 from gs_calendar_base import (
     _BaseCalendar,
-    _CalendarItem,
+    CalendarItem,
     ConvertDatetimeToTimeString,
     ConvertTimeStringToDatetime
 )
@@ -57,6 +55,10 @@ RE_ERROR_MESSAGE = re.compile('<m:MessageText>([\w\W]*)</m:MessageText>')
 
 RE_ATTENDEE = re.compile('<t:Attendee>([\w\W]*)</t:Attendee>')
 
+RE_CAL_FOLDER = re.compile('<t:CalendarFolder>([\w\W]*?)<\/t:CalendarFolder>')
+RE_FOLDER_ID = re.compile('<t:FolderId Id="(.*?)" ChangeKey="(.*?)"/>')
+RE_PARENT_FOLDER_ID = re.compile('<t:ParentFolderId Id="(.*?)" ChangeKey="(.*?)"/>')
+
 
 class EWS(_BaseCalendar):
     def __init__(
@@ -73,9 +75,9 @@ class EWS(_BaseCalendar):
             debug=False,
             persistentStorage=None,
     ):
-        self._username = username
-        self._password = password
-        self._impersonation = impersonation
+        self.username = username
+        self.password = password
+        self.impersonation = impersonation
         self._serverURL = serverURL
         self._authType = authType
         self._oauthCallback = oauthCallback
@@ -83,6 +85,7 @@ class EWS(_BaseCalendar):
         self._verifyCerts = verifyCerts
         self._debug = debug
 
+        #################################################################
         thisMachineTimezoneName = time.tzname[0]
         if thisMachineTimezoneName == 'EST':
             thisMachineTimezoneName = 'Eastern Standard Time'
@@ -101,13 +104,24 @@ class EWS(_BaseCalendar):
         if callable(oauthCallback) or authType == 'Oauth':
             self._authType = authType = 'Oauth'
         elif authType == 'Basic':
-            self._session.auth = requests.auth.HTTPBasicAuth(self._username, self._password)
+            self._session.auth = requests.auth.HTTPBasicAuth(self.username, self.password)
         else:
             raise TypeError('Unknown Authorization Type')
         self._useImpersonationIfAvailable = True
         self._useDistinguishedFolderMailbox = False
 
-        super().__init__(persistentStorage=persistentStorage, debug=debug)
+        self._batchQueue = []
+        self._folderIDs = {
+            # str(email): str(folderID)
+        }
+        self._otherEWSInstances = {
+            # str(email), EWS()
+        }
+        super().__init__(
+            name=impersonation or username,
+            persistentStorage=persistentStorage,
+            debug=debug
+        )
 
     def print(self, *a, **k):
         if self._debug:
@@ -115,33 +129,35 @@ class EWS(_BaseCalendar):
 
     def __str__(self):
         if self._oauthCallback:
-            return '<EWS: state={}, impersonation={}, auth={}, oauthCallback={}>'.format(
+            return '<EWS: state={}, impersonation={}, auth={}, oauthCallback={}{}>'.format(
                 self._connectionStatus,
-                self._impersonation,
+                self.impersonation,
                 self._authType,
                 self._oauthCallback,
+                ', id={}'.format(id(self)) if self._debug else '',
             )
         else:
-            return '<EWS: state={}, username={}, impersonation={}, auth={}>'.format(
+            return '<EWS: state={}, username={}, impersonation={}, auth={}{}>'.format(
                 self._connectionStatus,
-                self._username,
-                self._impersonation,
-                self._authType
+                self.username,
+                self.impersonation,
+                self._authType,
+                ', id={}'.format(id(self)) if self._debug else '',
             )
 
     @property
     def Impersonation(self):
-        return self._impersonation
+        return self.impersonation
 
     @Impersonation.setter
     def Impersonation(self, newImpersonation):
-        self._impersonation = newImpersonation
+        self.impersonation = newImpersonation
 
-    def _DoRequest(self, soapBody, truncatePrint=False):
+    def DoRequest(self, soapBody, truncatePrint=False, tryNumber=0):
         # API_VERSION = 'Exchange2013'
         # API_VERSION = 'Exchange2007_SP1'
 
-        if self._impersonation and self._useImpersonationIfAvailable:
+        if self.impersonation and self._useImpersonationIfAvailable:
             # Note: Don't add a namespace to the <ExchangeImpersonation> and <ConnectingSID> tags
             # This will cause a "You don't have permission to impersonate this account" error.
             # Don't ask my why.
@@ -157,7 +173,7 @@ class EWS(_BaseCalendar):
                 </t:ExchangeImpersonation>
             '''.format(
                 apiVersion=self._apiVersion,
-                impersonation=self._impersonation,
+                impersonation=self.impersonation,
             )
         else:
             soapHeader = '<t:RequestServerVersion Version="{apiVersion}" />'.format(apiVersion=self._apiVersion)
@@ -222,7 +238,7 @@ class EWS(_BaseCalendar):
                 if self._debug: print('Error Message:', match.group(1))
             self._NewConnectionStatus('Disconnected')
 
-            if 'The account does not have permission to impersonate the requested user.' in resp.text or not resp.ok:
+            if 'The account does not have permission to impersonate the requested user.' in resp.text or not resp.ok or 'ErrorImpersonateUserDenied' in resp.text:
                 if self._useImpersonationIfAvailable is True:
                     if self._debug: print('Switching impersonation mode')
 
@@ -231,7 +247,14 @@ class EWS(_BaseCalendar):
 
                     if self._debug: print('self._useImpersonationIfAvailable=', self._useImpersonationIfAvailable)
                     if self._debug: print('self._useDistinguishedFolderMailbox=', self._useDistinguishedFolderMailbox)
+                if tryNumber <= 3:
+                    self.print('Trying again')
+                    return self.DoRequest(
+                        soapBody=soapBody,
+                        truncatePrint=truncatePrint,
+                        tryNumber=tryNumber + 1,
 
+                    )
         return resp
 
     def UpdateCalendar(self, calendar=None, startDT=None, endDT=None):
@@ -245,7 +268,8 @@ class EWS(_BaseCalendar):
         startTimestring = ConvertDatetimeToTimeString(startDT)
         endTimestring = ConvertDatetimeToTimeString(endDT)
 
-        calendar = calendar or self._impersonation or self._username
+        calendar = calendar or self.impersonation or self.username
+        self.GetFolderInfo([calendar])
 
         if self._useDistinguishedFolderMailbox:
             parentFolder = '''
@@ -255,7 +279,7 @@ class EWS(_BaseCalendar):
                     </t:Mailbox>
                 </t:DistinguishedFolderId>
             '''.format(
-                impersonation=self._impersonation
+                impersonation=self.impersonation
             )
         else:
             parentFolder = '''
@@ -276,6 +300,7 @@ class EWS(_BaseCalendar):
                         <t:FieldURI FieldURI="item:HasAttachments" />
                         <t:FieldURI FieldURI="item:Size" />
                         <t:FieldURI FieldURI="item:Sensitivity" />
+                        <t:FieldURI FieldURI="calendar:IsOnlineMeeting" />
                     </t:AdditionalProperties>
                 </m:ItemShape>
                 <m:CalendarView 
@@ -292,10 +317,14 @@ class EWS(_BaseCalendar):
             endTimestring=endTimestring,
             parentFolder=parentFolder,
         )
-        resp = self._DoRequest(soapBody)
+        resp = self.DoRequest(soapBody)
         if resp.ok:
-            calItems = self._CreateCalendarItemsFromResponse(resp.text)
-            self.RegisterCalendarItems(calItems=calItems, startDT=startDT, endDT=endDT)
+            calItems = self.CreateCalendarItemsFromResponse(resp.text)
+            self.RegisterCalendarItems(
+                calItems=calItems,
+                startDT=startDT,
+                endDT=endDT,
+            )
         else:
             if 'ErrorImpersonateUserDenied' in resp.text:
                 if self._debug:
@@ -303,53 +332,167 @@ class EWS(_BaseCalendar):
                 return self.UpdateCalendar(calendar, startDT, endDT)
         return resp
 
-    def _CreateCalendarItemsFromResponse(self, responseString):
+    def StartBatchUpdate(self, calendar=None, startDT=None, endDT=None):
+        '''
+
+        :param calendar: str > email address of the calendar
+        :param startDT:
+        :param endDT:
+        :return:
+        '''
+        self._batchQueue.append({
+            'calendar': calendar,
+            'startDT': startDT,
+            'endDT': endDT
+        })
+
+    def DoBatchUpdate(self):
+        self.GetFolderInfo([
+            b['calendar'] for b in self._batchQueue
+        ])
+
+        # create the batch req
+        startDT = datetime.datetime.now()
+        endDT = datetime.datetime.now()
+
+        parentFolders = ''
+        for batch in self._batchQueue:
+            parentFolders += '''
+                           <t:DistinguishedFolderId Id="calendar">
+                               <t:Mailbox>
+                                   <t:EmailAddress>{email}</t:EmailAddress>
+                               </t:Mailbox>
+                           </t:DistinguishedFolderId>
+                       '''.format(
+                email=batch['calendar']
+            )
+
+            startDT = min(startDT, batch['startDT'])
+            endDT = max(endDT, batch['endDT'])
+
+        soapBody = ''' 
+           <m:FindItem Traversal="Shallow">
+               <m:ItemShape>
+                   <t:BaseShape>AllProperties</t:BaseShape>
+               </m:ItemShape>
+               <m:CalendarView 
+                   MaxEntriesReturned="100" 
+                   StartDate="{startTimestring}" 
+                   EndDate="{endTimestring}" 
+                   />
+               <m:ParentFolderIds>
+                    {parentFolders}
+               </m:ParentFolderIds>
+           </m:FindItem>
+        '''.format(
+            startTimestring=startDT.isoformat() + 'Z',
+            endTimestring=endDT.isoformat() + 'Z',
+            parentFolders=parentFolders,
+        )
+        resp = self.DoRequest(soapBody)
+        self.print('418 resp=', resp.text)
+
+        calItems = self.CreateCalendarItemsFromResponse(resp.text)
+
+        self.RegisterCalendarItems(
+            calendarNames=[b['calendar'] for b in self._batchQueue],
+            calItems=calItems,
+            startDT=startDT,
+            endDT=endDT
+        )
+        self._batchQueue.clear()
+
+    def GetEmailFromFolderID(self, fID):
+        for email, folderID in self._folderIDs.items():
+            if fID == folderID:
+                return email
+        else:
+            raise KeyError(
+                'Folder ID "{}" not found. self.folderIDs={}. You mightneed to call self.GetFolderInfo() first.'.format(
+                    fID,
+                    self._folderIDs
+                ))
+
+    def GetFolderInfo(self, emails=None):
+        '''
+
+        :param emails: list() of str(emailAddress)
+        :return: dict like {
+            # str(email): str(folderID)
+        }
+        '''
+        assert type(emails) == list, '"emails" must be of type list()'
+        self.print('GetFolderInfo(', emails)
+
+        # first make sure we have all the folder IDs
+        requestedFolders = []
+
+        parentFolders = ''
+        for email in emails:
+            if email in self._folderIDs and self._folderIDs[email]:
+                continue  # skip this one, we already have the ID
+
+            if email not in self._folderIDs:
+                requestedFolders.append(email)
+
+                parentFolders += '''
+                               <t:DistinguishedFolderId Id="calendar">
+                                   <t:Mailbox>
+                                       <t:EmailAddress>{email}</t:EmailAddress>
+                                   </t:Mailbox>
+                               </t:DistinguishedFolderId>
+                           '''.format(
+                    email=email
+                )
+
+        if len(parentFolders) == 0:
+            self.print('We already have all the folder info:', self._folderIDs)
+            return self._folderIDs
+
+        soapBody = ''' 
+                   <m:GetFolder>
+                      <m:FolderShape>
+                        <t:BaseShape>Default</t:BaseShape>
+                      </m:FolderShape>
+                      <m:FolderIds>
+                        {parentFolders}
+                      </m:FolderIds>
+                    </m:GetFolder>
+                    '''.format(
+            parentFolders=parentFolders,
+        )
+
+        resp = self.DoRequest(soapBody)
+        self.print('353 Getting folder Ids resp=', resp.text)
+
+        for index, matchCalendarFolder in enumerate(RE_CAL_FOLDER.finditer(resp.text)):
+            self.print('matchCalendarFolder.group(0)=', matchCalendarFolder.group(0))
+            matchFolderID = RE_FOLDER_ID.search(matchCalendarFolder.group(0))
+            if matchFolderID:
+                self._folderIDs[requestedFolders[index]] = matchFolderID.group(1)
+                self.print('found folder ID {email}={ID}'.format(
+                    email=requestedFolders[index],
+                    ID=matchFolderID.group(1)
+                ))
+
+        self.print('GetFolderInfo return', self._folderIDs)
+        return self._folderIDs
+
+    def CreateCalendarItemsFromResponse(self, xml):
         '''
 
         :param responseString:
         :return: list of calendar items
         '''
         ret = []
-        for matchCalItem in RE_CAL_ITEM.finditer(responseString):
-            self.print('matchCalItem=', matchCalItem.group(0))
-            # go thru the resposne and find any CalendarItems.
-            # parse their data and findMode CalendarItem objects
-            # store CalendarItem objects in self
-
-            # print('\nmatchCalItem.group(0)=', matchCalItem.group(0))
-
-            data = {}
-            startDT = None
-            endDT = None
-
-            matchItemId = RE_ITEM_ID.search(matchCalItem.group(0))
-            data['ItemId'] = matchItemId.group(1)
-            data['ChangeKey'] = matchItemId.group(2)
-            data['Subject'] = RE_SUBJECT.search(matchCalItem.group(0)).group(1)
-            data['OrganizerName'] = RE_ORGANIZER.search(matchCalItem.group(0)).group(1)
-
-            bodyMatch = RE_HTML_BODY.search(matchCalItem.group(0))
-            if bodyMatch:
-                if self._debug: print('bodyMatch=', bodyMatch)
-                data['Body'] = bodyMatch.group(1)
-
-            res = RE_HAS_ATTACHMENTS.search(matchCalItem.group(0)).group(1)
-            self.print('364 RE_HAS_ATTACHMENTS res=', res)
-
-            if 'true' in res:
-                data['HasAttachments'] = True
-            elif 'false' in res:
-                data['HasAttachments'] = False
-            else:
-                data['HasAttachments'] = 'Unknown'
-
-            startTimeString = RE_START_TIME.search(matchCalItem.group(0)).group(1)
-            endTimeString = RE_END_TIME.search(matchCalItem.group(0)).group(1)
-
-            startDT = ConvertTimeStringToDatetime(startTimeString)
-            endDT = ConvertTimeStringToDatetime(endTimeString)
-
-            calItem = _CalendarItem(startDT, endDT, data, self)
+        for item in GetCalendarItemDataFromXML(xml):
+            calItem = CalendarItem(
+                startDT=item['Start'],
+                endDT=item['End'],
+                data=item['Data'],
+                parentCalendar=self
+            )
+            self.print('521 calItem=', calItem)
             ret.append(calItem)
 
         return ret
@@ -377,7 +520,7 @@ class EWS(_BaseCalendar):
                     </t:Mailbox>
                 </t:DistinguishedFolderId>
             '''.format(
-                impersonation=self._impersonation,
+                impersonation=self.impersonation,
             )
         else:
             parentFolder = '''
@@ -397,6 +540,7 @@ class EWS(_BaseCalendar):
                         <t:End>{endTimeString}</t:End>
                         <t:MeetingTimeZone TimeZoneName="{tzName}" />
                         {attendeesXML}
+                        <t:IsOnlineMeeting>true</t:IsOnlineMeeting>
                     </t:CalendarItem>
                 </m:Items>
             </m:CreateItem>
@@ -409,10 +553,7 @@ class EWS(_BaseCalendar):
             tzName=self._myTimezoneName,
             attendeesXML=GetAttendeesXML(attendees),
         )
-        resp = self._DoRequest(soapBody)
-        if 'ErrorImpersonateUserDenied' in resp.text:
-            # try again
-            self.CreateCalendarEvent(subject=subject, body=body, startDT=startDT, endDT=endDT, attendees=attendees)
+        resp = self.DoRequest(soapBody)
 
     def ChangeEventTime(self, calItem, newStartDT=None, newEndDT=None):
         self.print('ChangeEventTime(', calItem, ', newStartDT=', newStartDT, ', newEndDT=', newEndDT)
@@ -465,10 +606,10 @@ class EWS(_BaseCalendar):
                 tzName=self._myTimezoneName,
                 # dont cuz: Error Message: An object within a change description must contain one and only one property to modify.
             )
-            self._DoRequest(soapBody)
+            self.DoRequest(soapBody)
 
     def ChangeEventBody(self, calItem, newBody):
-        if self._debug: print('ChangeEventBody(', calItem, newBody)
+        self.print('ChangeEventBody(', calItem, newBody)
 
         soapBody = """
             <m:UpdateItem MessageDisposition="SaveOnly" ConflictResolution="AlwaysOverwrite" SendMeetingInvitationsOrCancellations="SendToNone">
@@ -495,7 +636,7 @@ class EWS(_BaseCalendar):
             changeKey=calItem.Get('ChangeKey'),
             newBody=newBody,
         )
-        resp = self._DoRequest(soapBody)
+        resp = self.DoRequest(soapBody)
 
     def DeleteEvent(self, calItem):
         self.print('DeleteEvent(', calItem)
@@ -512,7 +653,7 @@ class EWS(_BaseCalendar):
             itemID=calItem.Get('ItemId'),
             changeKey=calItem.Get('ChangeKey'),
         )
-        resp = self._DoRequest(soapBody)
+        resp = self.DoRequest(soapBody)
 
     def GetAttachments(self, calItem):
         self.print('GetAttachments(', calItem)
@@ -541,19 +682,17 @@ class EWS(_BaseCalendar):
                 </m:GetItem>
               """.format(itemId)
 
-        resp = self._DoRequest(xmlBody)
-        if self._debug:
-            print('540 resp=', resp.status_code)
+        resp = self.DoRequest(xmlBody)
+        self.print('540 resp=', resp.status_code)
 
         foundNames = regExAttachmentName.findall(resp.text)
         foundIDs = regExAttachmentID.findall(resp.text)
 
         ret = dict(zip(foundNames, foundIDs))
 
-        if self._debug:
-            print('foundNames=', foundNames)
-            print('foundIDs=', foundIDs)
-            print('GetAttachments ret=', ret)
+        self.print('foundNames=', foundNames)
+        self.print('foundIDs=', foundIDs)
+        self.print('GetAttachments ret=', ret)
 
         return [_Attachment(ID, name, self) for name, ID in ret.items()]
 
@@ -562,8 +701,6 @@ class EWS(_BaseCalendar):
         # returns a list of attachment IDs
 
         itemId = calItem.Get('ItemId')
-        regExAttachmentID = re.compile('AttachmentId Id=\"(\S+)\"')
-        regExAttachmentName = re.compile('<t:Name>(.+)</t:Name>')
         xmlBody = """
                     <m:GetItem>
                       <m:ItemShape>
@@ -582,9 +719,8 @@ class EWS(_BaseCalendar):
                     </m:GetItem>
                   """.format(itemId)
 
-        resp = self._DoRequest(xmlBody)
-        if self._debug:
-            print('540 resp.text=', resp.text)
+        resp = self.DoRequest(xmlBody)
+        self.print('540 resp.text=', resp.text)
 
         ret = set()  # Use set() to prevent duplicates
         for matchEmail in RE_EMAIL_ADDRESS.finditer(resp.text):
@@ -627,7 +763,7 @@ class EWS(_BaseCalendar):
             changeKey=calendarItem.Get('ChangeKey'),
             attendeesXML=GetAttendeesXML(attendees)
         )
-        resp = self._DoRequest(soapBody)
+        resp = self.DoRequest(soapBody)
         self.print('633 resp.text=', resp.text)
 
 
@@ -661,8 +797,8 @@ class _Attachment:
             ID=self.ID,
         )
 
-        resp = self._parentExchange._DoRequest(xmlBody,
-                                               truncatePrint=True)  # the response can be up to 50MB and you dont want to print all that
+        resp = self._parentExchange.DoRequest(xmlBody,
+                                              truncatePrint=True)  # the response can be up to 50MB and you dont want to print all that
 
         responseCode = regExReponse.search(resp.text).group(1)
         if responseCode == 'NoError':  # Handle errors sent by the server
@@ -830,6 +966,174 @@ def GetAttendeesXML(attendeesList):
         return ''
 
 
+def GetCalendarItemDataFromXML(xml):
+    '''
+
+    :param xml: str
+    :return: list of dicts containing the calendar data
+    '''
+    ret = []
+    for matchCalItem in RE_CAL_ITEM.finditer(xml):
+        data = {}
+
+        matchItemId = RE_ITEM_ID.search(matchCalItem.group(0))
+        data['ItemId'] = matchItemId.group(1)
+        data['ChangeKey'] = matchItemId.group(2)
+        data['Subject'] = RE_SUBJECT.search(matchCalItem.group(0)).group(1)
+        data['OrganizerName'] = RE_ORGANIZER.search(matchCalItem.group(0)).group(1)
+
+        parentFolderIdMatch = RE_PARENT_FOLDER_ID.search(matchCalItem.group(0))
+        if parentFolderIdMatch:
+            data['ParentFolderId'] = parentFolderIdMatch.group(1)
+
+        bodyMatch = RE_HTML_BODY.search(matchCalItem.group(0))
+        if bodyMatch:
+            data['Body'] = bodyMatch.group(1)
+
+        res = RE_HAS_ATTACHMENTS.search(matchCalItem.group(0)).group(1)
+
+        if 'true' in res:
+            data['HasAttachments'] = True
+        elif 'false' in res:
+            data['HasAttachments'] = False
+        else:
+            data['HasAttachments'] = 'Unknown'
+
+        startTimeString = RE_START_TIME.search(matchCalItem.group(0)).group(1)
+        endTimeString = RE_END_TIME.search(matchCalItem.group(0)).group(1)
+
+        startDT = ConvertTimeStringToDatetime(startTimeString)
+        endDT = ConvertTimeStringToDatetime(endTimeString)
+
+        calItem = {
+            'Start': startDT,
+            'End': endDT,
+            'Data': data,
+        }
+        ret.append(calItem)
+
+    return ret
+
+
+class EWS_BatchManager:
+    def __init__(
+            self,
+            username=None,
+            password=None,
+            oauthCallback=None,
+            debug=True,
+            persistentStorageDirectory=None,
+    ):
+        self.username = username
+        self.password = password
+        self.oauthCallback = oauthCallback
+        self._debug = debug
+        self.persistentStorageDirectory = persistentStorageDirectory
+
+        ##############################################
+        self.ews_instances = {
+            # str(emailAddress): EWS(),
+        }
+
+    def print(self, *a, **k):
+        if self._debug:
+            print(*a, **k)
+
+    def GetEWS(self, email=None):
+        email = email.lower() if email else None
+
+        if email and email in self.ews_instances:
+            return self.ews_instances[email]
+        else:
+            newEWS = EWS(
+                username=self.username,
+                password=self.password,
+                oauthCallback=self.oauthCallback,
+                impersonation=email,
+                debug=self._debug,
+                persistentStorage='{}/{}.json'.format(
+                    self.persistentStorageDirectory,
+                    email,
+                ) if self.persistentStorageDirectory and email else None,
+            )
+            self.ews_instances[email] = newEWS
+            return newEWS
+
+    def UpdateCalendarBatch(self, calendars, startDT=None, endDT=None):
+        '''
+
+        :param calendars: list of str(emailAddresses)
+        :param startDT: datetime object
+        :param endDT: datetime object
+        :return:
+        '''
+
+        # create the batch req
+        startDT = startDT or datetime.datetime.now() - datetime.timedelta(days=-1)
+        endDT = endDT or startDT + datetime.timedelta(days=2)
+
+        parentFolders = ''
+        for cal in calendars:
+            parentFolders += '''
+                           <t:DistinguishedFolderId Id="calendar">
+                               <t:Mailbox>
+                                   <t:EmailAddress>{email}</t:EmailAddress>
+                               </t:Mailbox>
+                           </t:DistinguishedFolderId>
+                       '''.format(
+                email=cal
+            )
+
+        soapBody = ''' 
+           <m:FindItem Traversal="Shallow">
+               <m:ItemShape>
+                   <t:BaseShape>AllProperties</t:BaseShape>
+               </m:ItemShape>
+               <m:CalendarView 
+                   MaxEntriesReturned="100" 
+                   StartDate="{startTimestring}" 
+                   EndDate="{endTimestring}" 
+                   />
+               <m:ParentFolderIds>
+                    {parentFolders}
+               </m:ParentFolderIds>
+           </m:FindItem>
+        '''.format(
+            startTimestring=startDT.isoformat() + 'Z',
+            endTimestring=endDT.isoformat() + 'Z',
+            parentFolders=parentFolders,
+        )
+        ews = self.GetEWS()
+        resp = ews.DoRequest(soapBody)
+        self.print('87 batch resp=', resp.text)
+
+        items = GetCalendarItemDataFromXML(resp.text)
+
+        ret = []
+        ews.GetFolderInfo(emails=calendars)
+        for item in items:
+            email = ews.GetEmailFromFolderID(item['Data']['ParentFolderId'])
+
+            ret.append(
+                CalendarItem(
+                    startDT=item['Start'],
+                    endDT=item['End'],
+                    data=item['Data'],
+                    parentCalendar=self.GetEWS(email),
+                )
+            )
+
+        for ews in self.ews_instances.values():
+            ews.RegisterCalendarItems(
+                calItems=[item for item in ret if item.parentCalendar == ews],
+                startDT=startDT,
+                endDT=endDT,
+            )
+            ews.SaveCalendarItemsToFile()
+
+        return ret
+
+
 if __name__ == '__main__':
     import creds
     import gs_oauth_tools
@@ -859,40 +1163,20 @@ if __name__ == '__main__':
     print('636 user=', user)
     ews = EWS(
 
-        # gm has ApplicationImpersonation
-        # username='gm_service_account@extrondemo.com',
-        # impersonation='rf_a120@extrondemo.com',
-        # password='Extron2500',
-        # debug=True,
-
-        # username='rf_a101@extrondemo.com',
-        # password='Extron123!',
-
-        # username='gm_service_account@extrondemo.com',
-        # password='Extron1025',
-
-        # username='impersonation-onprem@extron.com',
-        # impersonation='Test-pm4@extron.com',
-        # password='Extron1025',
-
         username=None if useOauth else creds.username,
         password=None if useOauth else creds.password,
         impersonation='rnchallwaysignage1@extron.com',
         oauthCallback=None if useOauth is False else user.GetAccessToken,
         debug=True,
-
-        # Covestro mock up
-        # username='rf_covestro@extrondemo.com',
-        # impersonation='rf_a112@extrondemo.com',
-        # password='Extron123!',
-
+        # persistentStorage='test_persistant.json',
     )
 
     ews.Connected = lambda _, state: print('EWS', state)
     ews.Disconnected = lambda _, state: print('EWS', state)
-    ews.NewCalendarItem = lambda _, item: print('NewCalendarItem(', item)
-    ews.CalendarItemChanged = lambda _, item: print('CalendarItemChanged(', item)
-    ews.CalendarItemDeleted = lambda _, item: print('CalendarItemDeleted(', item)
+    ews.NewCalendarItem = lambda cal, item: print('NewCalendarItem(', cal, item)
+    ews.CalendarItemChanged = lambda cal, item: print('CalendarItemChanged(', cal, item)
+    ews.CalendarItemDeleted = lambda cal, item: print('CalendarItemDeleted(', cal, item)
+
     ews.UpdateCalendar(
         startDT=datetime.datetime.now().replace(hour=0, minute=0),
         endDT=datetime.datetime.now().replace(hour=23, minute=59)
@@ -943,4 +1227,34 @@ if __name__ == '__main__':
                 ews.ChangeAttendees(event, addList=['gmiller@extron.com'])
 
 
-    TestAttendees()
+    # TestAttendees()
+
+    def TestBatch():
+        import creds
+        import time
+
+        batch = EWS_BatchManager(
+            username=creds.username,
+            password=creds.password,
+            persistentStorageDirectory='test',
+        )
+
+        calendars = [  # The list of calendars that will be batched together
+            'rnchallwaysignage1@extron.com',
+            'rnchallwaysignage2@extron.com',
+            'rnchallwaysignage3@extron.com',
+            'rnclobbysignage@extron.com',
+        ]
+
+        calItems = batch.UpdateCalendarBatch(
+            calendars=calendars,
+        )
+        print('len(calitems)=', len(calItems))
+        for item in calItems:
+            print('item=', item, 'parent=', item.parentCalendar)
+
+        while True:
+            time.sleep(5)
+            print('while True')
+
+    # TestBatch()
